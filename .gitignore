@@ -1,0 +1,48 @@
+# Virtual environments
+venv/
+env/
+ENV/
+*.venv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+alert_checker.log
+
+# Cache
+.cache/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+seen_lp_alerts.json
+preview_no_alerts.html
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
