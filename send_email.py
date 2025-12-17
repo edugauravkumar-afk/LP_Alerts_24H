@@ -14,7 +14,7 @@ def send_alert_email(
     logo_url: str = None,
     smtp_server: str = None,
     smtp_port: int = 25,
-    from_address: str = "noreply@taboola.com",
+    from_address: str = "lp_change_alert@taboola.com",
     cc_recipients: List[str] = None,
 ) -> bool:
     """

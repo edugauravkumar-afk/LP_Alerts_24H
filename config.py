@@ -38,7 +38,7 @@ REGION_LABEL = {
 
 # Email constants
 EMAIL_SETTINGS = {
-    "from_address": "noreply@taboola.com",
+    "from_address": "lp_change_alert@taboola.com",
     "subject": "LP Changes LATAM & Greater China English Campaigns",
     "logo_url": "https://www.taboola.com/assets/taboola-logo-dark.png",
 }
