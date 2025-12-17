@@ -10,8 +10,10 @@ set PYTHON_PATH=%SCRIPT_DIR%venv\Scripts\python.exe
 
 REM Check if virtual environment exists
 if not exist "%PYTHON_PATH%" (
-    echo ❌ Virtual environment not found at %PYTHON_PATH%
-    echo Please run: bash setup.sh
+    echo.
+    echo Error: Virtual environment not found
+    echo Please run: python -m venv venv
+    echo.
     pause
     exit /b 1
 )
@@ -19,34 +21,31 @@ if not exist "%PYTHON_PATH%" (
 REM Check if running as Administrator
 net session >nul 2>&1
 if %errorLevel% neq 0 (
-    echo ❌ This script must be run as Administrator
-    echo Please right-click and select "Run as Administrator"
+    echo.
+    echo Error: This script must be run as Administrator
+    echo Please right-click CMD and select "Run as administrator"
+    echo.
     pause
     exit /b 1
 )
 
 REM Create the task
-echo Creating scheduled task "LP_Alerts_24H"...
-schtasks /create ^
-    /tn "LP_Alerts_24H" ^
-    /tr "%PYTHON_PATH% %SCRIPT_DIR%main.py" ^
-    /sc daily ^
-    /st 08:00 ^
-    /ru SYSTEM ^
-    /f
+echo Creating scheduled task LP_Alerts_24H...
+schtasks /create /tn "LP_Alerts_24H" /tr "%PYTHON_PATH% %SCRIPT_DIR%main.py" /sc daily /st 08:00 /ru SYSTEM /f
 
 if %errorLevel% equ 0 (
-    echo ✅ Task created successfully!
-    echo 🕐 LP Alerts will run daily at 08:00 AM UTC
     echo.
-    echo To view the task:
-    echo   schtasks /query /tn "LP_Alerts_24H" /v
+    echo Success! Task created.
+    echo LP Alerts will run daily at 08:00 AM
     echo.
-    echo To delete the task:
-    echo   schtasks /delete /tn "LP_Alerts_24H" /f
+    echo View task: schtasks /query /tn "LP_Alerts_24H" /v
+    echo Delete task: schtasks /delete /tn "LP_Alerts_24H" /f
+    echo.
 ) else (
-    echo ❌ Failed to create task
-    echo This script must be run as Administrator
+    echo.
+    echo Error: Failed to create task
+    echo Run as Administrator
+    echo.
     pause
     exit /b 1
 )
