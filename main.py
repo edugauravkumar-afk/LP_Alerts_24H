@@ -4,13 +4,12 @@ GeoEdge LP Alerts System - Clean Start
 Database queries and email alerts for LP changes
 """
 
-import json
 import os
 import sys
 import smtplib
 import requests
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import pymysql
@@ -252,6 +251,7 @@ def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[
                     p.project_id,
                     p.campaign_id,
                     lp.advertiser_id as account_id,
+                    pub.name as account_name,
                     pub.country,
                     pub.name as publisher_name,
                     p.locations,
@@ -302,6 +302,7 @@ def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[
             for result in project_data[project_id]:
                 campaign_id = result["campaign_id"]
                 account_id = result["account_id"]
+                account_name = result.get("account_name", "Unknown")
                 country = result["country"]
                 publisher_name = result["publisher_name"]
                 locations = result["locations"]
@@ -313,6 +314,7 @@ def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[
                 enhanced_alert.update({
                     "campaign_id": campaign_id,
                     "account_id": account_id,
+                    "account_name": account_name,
                     "publisher_country": country,
                     "publisher_name": publisher_name,
                     "campaign_locations": locations,
@@ -325,46 +327,6 @@ def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[
     
     log_message(f"✅ Found {len(matching_alerts)} matching alerts for target regions")
     return matching_alerts
-
-
-def load_seen_alerts() -> Set[str]:
-    """Load previously sent alerts"""
-    seen_file = "seen_lp_alerts.json"
-    
-    if os.path.exists(seen_file):
-        try:
-            with open(seen_file, "r") as f:
-                return set(json.load(f))
-        except Exception:
-            return set()
-    
-    return set()
-
-
-def save_seen_alerts(seen: Set[str]) -> None:
-    """Save seen alerts"""
-    seen_file = "seen_lp_alerts.json"
-    
-    try:
-        with open(seen_file, "w") as f:
-            json.dump(sorted(list(seen)), f, indent=2)
-    except Exception as e:
-        log_message(f"⚠️ Warning: Could not save seen alerts: {str(e)}")
-
-
-def deduplicate_alerts(alerts: List[Dict[str, Any]], seen: Set[str]) -> List[Dict[str, Any]]:
-    """Remove already seen alerts"""
-    
-    new_alerts = []
-    
-    for alert in alerts:
-        alert_key = f"{alert['account_id']}_{alert['campaign_id']}"
-        
-        if alert_key not in seen:
-            new_alerts.append(alert)
-    
-    log_message(f"✅ Deduplication: {len(new_alerts)} new / {len(alerts)} total")
-    return new_alerts
 
 
 def send_alert_email(recipients: List[str], alerts: List[Dict[str, Any]], 
@@ -431,12 +393,13 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
     def create_alert_table(region_alerts, region_name, icon):
         if not region_alerts:
             return ""
-            
-        rows = ""
+        
+        # Group alerts by account_id + trigger_type combination
+        grouped_alerts = {}
         for alert in region_alerts:
             account_id = alert.get("account_id", "Unknown")
+            account_name = alert.get("account_name", "Unknown")
             publisher_country = alert.get("publisher_country", "Unknown")
-            campaign_id = alert.get("campaign_id", "Unknown")
             campaign_locations = alert.get("campaign_locations", "Unknown")
             
             # Get proper trigger name
@@ -450,25 +413,58 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
                 elif trigger_id == 14:
                     trigger_name = "AUTO REDIRECT"
             
-            # Create proper GeoEdge alert link
+            # Create unique key for grouping by account + alert type
+            group_key = f"{account_id}|{trigger_name}|{publisher_country}|{campaign_locations}"
+            
+            if group_key not in grouped_alerts:
+                grouped_alerts[group_key] = {
+                    "account_id": account_id,
+                    "account_name": account_name,
+                    "publisher_country": publisher_country,
+                    "campaign_locations": campaign_locations,
+                    "trigger_name": trigger_name,
+                    "campaign_ids": [],
+                    "alert_links": []
+                }
+            
+            # Add campaign ID and alert link to the group
+            campaign_id = alert.get("campaign_id", "Unknown")
+            if campaign_id not in grouped_alerts[group_key]["campaign_ids"]:
+                grouped_alerts[group_key]["campaign_ids"].append(campaign_id)
+            
+            # Create alert link
             alert_id = alert.get("alert_id", "")
             project_id = alert.get("project_id", "")
-            
             if alert_id and project_id:
-                # GeoEdge alert URL format - updated to match the working UI URL
                 geoedge_url = f"https://site.geoedge.com/analyticsv2/alertshistory/{alert_id}/1/off/"
-                alert_link = f'<a href="{geoedge_url}" target="_blank" style="color: #1a73e8; text-decoration: underline;">View Alert</a>'
-            else:
-                alert_link = '<span style="color: #999;">N/A</span>'
+                alert_link = f'<a href="{geoedge_url}" target="_blank" style="color: #1a73e8; text-decoration: underline;">View</a>'
+                if alert_link not in grouped_alerts[group_key]["alert_links"]:
+                    grouped_alerts[group_key]["alert_links"].append(alert_link)
+        
+        # Generate rows from grouped data
+        rows = ""
+        for group_data in grouped_alerts.values():
+            account_id = group_data["account_id"]
+            account_name = group_data.get("account_name", "Unknown")
+            publisher_country = group_data["publisher_country"]
+            campaign_locations = group_data["campaign_locations"]
+            trigger_name = group_data["trigger_name"]
+            
+            # Join campaign IDs with commas (convert to strings first)
+            campaign_ids_str = ", ".join(str(cid) for cid in group_data["campaign_ids"])
+            
+            # Join alert links with " | " separator
+            alert_links_str = " | ".join(group_data["alert_links"]) if group_data["alert_links"] else '<span style="color: #999;">N/A</span>'
             
             rows += f"""
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;">{account_id}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">{account_name}</td>
                 <td style="padding: 8px; border: 1px solid #ddd;">{publisher_country}</td>
-                <td style="padding: 8px; border: 1px solid #ddd;">{campaign_id}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">{campaign_ids_str}</td>
                 <td style="padding: 8px; border: 1px solid #ddd;">{campaign_locations}</td>
                 <td style="padding: 8px; border: 1px solid #ddd;">{trigger_name}</td>
-                <td style="padding: 8px; border: 1px solid #ddd;">{alert_link}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">{alert_links_str}</td>
             </tr>
             """
         
@@ -481,11 +477,12 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
                 <thead>
                     <tr style="background-color: #2c5282; color: white;">
                         <th style="padding: 10px; border: 1px solid #ddd;">Account ID</th>
+                        <th style="padding: 10px; border: 1px solid #ddd;">Account Name</th>
                         <th style="padding: 10px; border: 1px solid #ddd;">Country</th>
-                        <th style="padding: 10px; border: 1px solid #ddd;">Campaign ID</th>
+                        <th style="padding: 10px; border: 1px solid #ddd;">Campaign IDs</th>
                         <th style="padding: 10px; border: 1px solid #ddd;">Target Locations</th>
                         <th style="padding: 10px; border: 1px solid #ddd;">Alert Type</th>
-                        <th style="padding: 10px; border: 1px solid #ddd;">Alert Link</th>
+                        <th style="padding: 10px; border: 1px solid #ddd;">Alert Links</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -555,7 +552,7 @@ def main():
         
         if not alerts:
             log_message("⚠️ No alerts found from API")
-            new_alerts = []
+            filtered_alerts = []
         else:
             log_message(f"✅ Found {len(alerts)} alerts from API")
             
@@ -564,13 +561,9 @@ def main():
             
             if not filtered_alerts:
                 log_message("⚠️ No alerts match target regions (LATAM + Greater China)")
-                new_alerts = []
-            else:
-                # Step 3: Deduplicate
-                seen = load_seen_alerts()
-                new_alerts = deduplicate_alerts(filtered_alerts, seen)
+                filtered_alerts = []
         
-        # Step 4: Send email (even if no new alerts)
+        # Step 3: Send email (even if no alerts)
         recipients = os.getenv("RECIPIENTS", "").strip()
         if not recipients:
             log_message("⚠️ No RECIPIENTS configured in .env")
@@ -584,16 +577,8 @@ def main():
         if cc_list:
             log_message(f"📧 CC: {', '.join(cc_list)}")
         
-        if send_alert_email(recipient_list, new_alerts, cc_recipients=cc_list):
-            # Update seen alerts only if there were new alerts
-            if new_alerts:
-                seen = load_seen_alerts()
-                for alert in new_alerts:
-                    alert_key = f"{alert['account_id']}_{alert['campaign_id']}"
-                    seen.add(alert_key)
-                save_seen_alerts(seen)
-            
-            log_message(f"✅ Alert check complete: {len(new_alerts)} alerts sent to {len(recipient_list)} recipients")
+        if send_alert_email(recipient_list, filtered_alerts, cc_recipients=cc_list):
+            log_message(f"✅ Alert check complete: {len(filtered_alerts)} alerts sent to {len(recipient_list)} recipients")
         else:
             log_message("❌ Failed to send email")
     
