@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-24-Hour LP Alert Checker
-Monitors landing page changes for LATAM & Greater China campaigns
-Sends email alerts when new changes detected
+GeoEdge LP Alerts System - Clean Start
+Database queries and email alerts for LP changes
 """
 
 import json
 import os
 import sys
-import time
+import smtplib
 import requests
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Set
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import pymysql
 from pymysql import MySQLError
 from dotenv import load_dotenv
@@ -19,11 +20,9 @@ from dotenv import load_dotenv
 # Import local modules
 from config import (
     ENGLISH_COUNTRIES, LATAM_COUNTRIES, GREATER_CHINA_COUNTRIES,
-    TARGET_REGIONS, ALERT_CHECK_HOURS, ALERT_TYPE,
-    API_TIMEOUT_SECONDS, MAX_API_RETRIES, RETRY_BACKOFF_SECONDS,
+    TARGET_REGIONS, ALERT_CHECK_HOURS,
     EMAIL_SETTINGS, COUNTRY_DISPLAY
 )
-from send_email import send_alert_email
 
 load_dotenv()
 
@@ -68,221 +67,268 @@ def get_database_connection():
     )
 
 
-def get_english_campaigns() -> Set[int]:
-    """Get all campaigns targeting English countries"""
-    log_message("📍 Fetching campaigns targeting English countries...")
-    
-    try:
-        connection = get_database_connection()
-        
-        with connection.cursor() as cursor:
-            # Build location filter - use OR conditions for each country
-            conditions = " OR ".join([f"locations LIKE %s" for _ in ENGLISH_COUNTRIES])
-            sql = f"""
-                SELECT DISTINCT campaign_id
-                FROM trc.geo_edge_projects
-                WHERE {conditions}
-                LIMIT 100000
-            """
-            
-            # Create pattern list with wildcards
-            patterns = [f"%{country}%" for country in ENGLISH_COUNTRIES]
-            cursor.execute(sql, patterns)
-            results = cursor.fetchall()
-            
-            campaign_ids = {row["campaign_id"] for row in results}
-            log_message(f"✅ Found {len(campaign_ids)} English-targeting campaigns")
-            
-            connection.close()
-            return campaign_ids
-    
-    except MySQLError as e:
-        log_message(f"❌ Database error: {str(e)}")
-        raise
-
-
-def fetch_lp_alerts_with_retry(hours: int = ALERT_CHECK_HOURS) -> List[Dict[str, Any]]:
+def fetch_alerts_from_geoedge() -> List[Dict[str, Any]]:
     """
-    Fetch LP alerts from GeoEdge API using chunked queries to avoid timeouts
-    
-    Args:
-        hours: Number of hours to look back
-    
-    Returns:
-        List of LP_CHANGE alerts
+    Fetch alerts for 3 trigger types: LP Change, Creative Change, Auto Redirect
+    Targeting countries: US, GB, CA, AU
     """
     
     api_key = _env_or_fail("GEOEDGE_API_KEY")
-    api_base = os.getenv("GEOEDGE_API_BASE", "https://api.geoedge.com/rest/analytics/v3")
+    base_url = "https://api.geoedge.com/rest/analytics/v3/alerts/history"
     
-    now = datetime.now(timezone.utc)
-    start_date = now - timedelta(hours=hours)
-    
-    log_message(f"📅 Fetching LP alerts for last {hours} hours: {start_date.strftime('%Y-%m-%d %H:%M:%S')} to {now.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    url = f"{api_base}/alerts/history"
     headers = {
         "Authorization": api_key,
         "Content-Type": "application/json"
     }
     
+    log_message(f"🔍 Fetching alerts for 3 trigger types from target countries")
+    
+    # Define trigger types: LP Change, Creative Change, Auto Redirect
+    trigger_types = {
+        "25": "LP Change",
+        "35": "Creative Change", 
+        "14": "Auto Redirect"  # Common auto redirect trigger ID
+    }
+    
+    target_countries = "US,GB,CA,AU"
     all_alerts = []
-    chunk_hours = 4  # Query in 4-hour chunks to avoid timeouts
     
-    current_end = now
-    chunk_number = 0
-    
-    while current_end > start_date:
-        chunk_number += 1
-        current_start = max(start_date, current_end - timedelta(hours=chunk_hours))
-        
-        min_datetime = current_start.strftime("%Y-%m-%d %H:%M:%S")
-        max_datetime = current_end.strftime("%Y-%m-%d %H:%M:%S")
+    # Try each trigger type separately
+    for trigger_id, trigger_name in trigger_types.items():
+        log_message(f"📡 Fetching {trigger_name} alerts (trigger_type_id={trigger_id})")
         
         params = {
-            "min_datetime": min_datetime,
-            "max_datetime": max_datetime,
-            "page_limit": 5000,
-            "max_pages": 100
+            "alert_id": "02d0f59e8dc68664c18d243b01ec0f55",
+            "trigger_type_id": trigger_id,
+            "full_raw": 1,
+            "location_id": target_countries
         }
         
-        log_message(f"  📦 Chunk {chunk_number}: {min_datetime} to {max_datetime}")
-        
-        for attempt in range(1, MAX_API_RETRIES + 1):
-            timeout = 60 + (attempt - 1) * 60  # 60s, 120s, 180s
+        try:
+            log_message(f"   URL: {base_url}")
+            log_message(f"   Params: {params}")
             
-            try:
-                response = requests.get(url, headers=headers, params=params, timeout=timeout)
+            response = requests.get(base_url, headers=headers, params=params, timeout=60)
+            
+            log_message(f"   Status Code: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
                 
-                if response.status_code == 200:
-                    data = response.json()
-                    alerts = data.get("alerts", [])
+                # Check different possible alert locations in response
+                alerts = []
+                if "alerts" in data:
+                    alerts = data["alerts"]
+                elif "response" in data and "alerts" in data["response"]:
+                    alerts = data["response"]["alerts"]
+                
+                if alerts:
+                    log_message(f"   ✅ Found {len(alerts)} {trigger_name} alerts")
                     
-                    # Filter for LP_CHANGE events
-                    lp_alerts = [a for a in alerts if ALERT_TYPE in a.get("alert_type", "").upper()]
+                    # Add trigger type info to each alert
+                    for alert in alerts:
+                        alert["trigger_type_name"] = trigger_name
                     
-                    log_message(f"     ✅ Got {len(lp_alerts)} LP_CHANGE alerts")
-                    all_alerts.extend(lp_alerts)
-                    break
-                
-                elif response.status_code == 504:
-                    if attempt < MAX_API_RETRIES:
-                        wait_time = RETRY_BACKOFF_SECONDS[attempt - 1]
-                        log_message(f"     ⏳ Retry {attempt}/{MAX_API_RETRIES} in {wait_time}s...")
-                        time.sleep(wait_time)
-                    else:
-                        log_message(f"     ⚠️ Chunk {chunk_number} timeout after {MAX_API_RETRIES} retries, continuing...")
-                        break
-                
+                    all_alerts.extend(alerts)
                 else:
-                    log_message(f"     ⚠️ API error {response.status_code}, continuing...")
-                    break
+                    log_message(f"   ⚠️ No {trigger_name} alerts found")
             
-            except requests.Timeout:
-                if attempt < MAX_API_RETRIES:
-                    wait_time = RETRY_BACKOFF_SECONDS[attempt - 1]
-                    log_message(f"     ⏳ Retry {attempt}/{MAX_API_RETRIES} in {wait_time}s...")
-                    time.sleep(wait_time)
-                else:
-                    log_message(f"     ⚠️ Chunk {chunk_number} timeout after {MAX_API_RETRIES} retries, continuing...")
-                    break
-            
-            except Exception as e:
-                log_message(f"     ⚠️ Error in chunk {chunk_number}: {str(e)}, continuing...")
-                break
+            else:
+                log_message(f"   ❌ {trigger_name} API failed with status {response.status_code}")
         
-        current_end = current_start
+        except Exception as e:
+            log_message(f"   ❌ {trigger_name} API error: {str(e)}")
     
-    log_message(f"  ✅ Retrieved {len(all_alerts)} total LP_CHANGE alerts across all chunks")
-    return all_alerts
+    if all_alerts:
+        log_message(f"✅ TOTAL SUCCESS: Found {len(all_alerts)} alerts across all trigger types")
+        
+        # Show breakdown by trigger type
+        trigger_counts = {}
+        location_counts = {}
+        
+        for alert in all_alerts:
+            trigger_name = alert.get("trigger_type_name", "Unknown")
+            trigger_counts[trigger_name] = trigger_counts.get(trigger_name, 0) + 1
+            
+            location = alert.get("location", {})
+            for country_code, country_name in location.items():
+                location_counts[f"{country_code} ({country_name})"] = location_counts.get(f"{country_code} ({country_name})", 0) + 1
+        
+        log_message(f"📊 BREAKDOWN BY TRIGGER TYPE:")
+        for trigger_name, count in trigger_counts.items():
+            log_message(f"   {trigger_name}: {count} alerts")
+        
+        log_message(f"📍 BREAKDOWN BY LOCATION:")
+        for location, count in location_counts.items():
+            log_message(f"   {location}: {count} alerts")
+        
+        # Show sample alert structure
+        log_message(f"📋 SAMPLE ALERT DATA:")
+        log_message(f"=" * 60)
+        
+        if len(all_alerts) > 0:
+            alert = all_alerts[0]
+            log_message(f"Alert Keys: {list(alert.keys())}")
+            log_message(f"Trigger Type: {alert.get('trigger_type_id')} - {alert.get('trigger_type_name')}")
+            log_message(f"Location: {alert.get('location')}")
+            log_message(f"Alert Name: {alert.get('alert_name')}")
+            log_message(f"Event Time: {alert.get('event_datetime')}")
+            log_message(f"Project Name: {alert.get('project_name')}")
+        
+        log_message(f"=" * 60)
+        return all_alerts
+    
+    else:
+        log_message(f"❌ No alerts found for any trigger type")
+        return []
 
 
-def match_alerts_to_publishers(
-    alerts: List[Dict[str, Any]],
-    english_campaigns: Set[int]
-) -> List[Dict[str, Any]]:
+def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Match alerts to publishers and filter for LATAM & Greater China
-    
-    Args:
-        alerts: List of raw alerts from API
-        english_campaigns: Set of campaign IDs targeting English countries
-    
-    Returns:
-        Filtered list of alerts matching criteria
+    Process alerts and find campaigns targeting LATAM & Greater China regions
+    Optimized with batch queries for better performance
     """
     
-    log_message("🔍 Matching alerts to publishers...")
+    log_message(f"🏢 Processing {len(alerts)} alerts to find target region campaigns")
     
+    if not alerts:
+        return []
+    
+    # Step 1: Filter alerts by target countries (fast, no DB queries)
+    target_countries = {"US", "GB", "CA", "AU"}
+    filtered_alerts = []
+    
+    for alert in alerts:
+        location = alert.get("location", {})
+        if not location:
+            continue
+            
+        location_codes = list(location.keys())
+        if any(code in target_countries for code in location_codes):
+            location_code = list(location.keys())[0]
+            location_name = list(location.values())[0]
+            
+            # Extract project info
+            project_name_dict = alert.get("project_name", {})
+            if not project_name_dict:
+                continue
+                
+            project_ids = list(project_name_dict.keys())
+            if not project_ids:
+                continue
+                
+            project_id = project_ids[0]
+            project_name = project_name_dict[project_id]
+            
+            enhanced_alert = alert.copy()
+            enhanced_alert.update({
+                "location_code": location_code,
+                "location_name": location_name,
+                "project_id": project_id,
+                "project_name": project_name
+            })
+            filtered_alerts.append(enhanced_alert)
+    
+    log_message(f"📊 Filtered to {len(filtered_alerts)} alerts from target countries")
+    
+    if not filtered_alerts:
+        return []
+    
+    # Step 2: Extract unique project IDs for batch query
+    unique_project_ids = list(set(alert["project_id"] for alert in filtered_alerts))
+    log_message(f"🔍 Querying database for {len(unique_project_ids)} unique projects")
+    
+    # Step 3: Single batch query for all projects
+    project_data = {}
     try:
         connection = get_database_connection()
-        matched_alerts = []
         
-        for alert in alerts:
-            campaign_id = alert.get("campaign", {}).get("id")
+        with connection.cursor() as cursor:
+            # Create placeholders for IN clause
+            placeholders = ','.join(['%s'] * len(unique_project_ids))
             
-            # Check if campaign targets English countries
-            if campaign_id not in english_campaigns:
-                continue
+            sql = f"""
+                SELECT DISTINCT
+                    p.project_id,
+                    p.campaign_id,
+                    lp.advertiser_id as account_id,
+                    pub.country,
+                    pub.name as publisher_name,
+                    p.locations,
+                    CASE 
+                        WHEN pub.country IN ('MX', 'AR', 'BR', 'CL', 'CO', 'PE') THEN 'LATAM'
+                        WHEN pub.country IN ('CN', 'HK', 'TW', 'MO') THEN 'Greater China'
+                        ELSE 'Other'
+                    END AS region_type
+                FROM trc.geo_edge_projects p
+                JOIN trc.geo_edge_landing_pages lp ON p.campaign_id = lp.campaign_id
+                JOIN trc.publishers pub ON lp.advertiser_id = pub.id
+                WHERE p.project_id IN ({placeholders})
+                    AND pub.country IN ('MX', 'AR', 'BR', 'CL', 'CO', 'PE', 'CN', 'HK', 'TW', 'MO')
+            """
             
-            # Get landing page info
-            with connection.cursor() as cursor:
-                sql = """
-                    SELECT advertiser_id
-                    FROM trc.geo_edge_landing_pages
-                    WHERE campaign_id = %s
-                    LIMIT 1
-                """
-                cursor.execute(sql, (campaign_id,))
-                lp_result = cursor.fetchone()
-                
-                if not lp_result:
-                    continue
-                
-                advertiser_id = lp_result["advertiser_id"]
-                
-                # Get publisher country
-                sql = """
-                    SELECT country
-                    FROM trc.publishers
-                    WHERE id = %s
-                    LIMIT 1
-                """
-                cursor.execute(sql, (advertiser_id,))
-                pub_result = cursor.fetchone()
-                
-                if not pub_result:
-                    continue
-                
-                country = pub_result["country"]
-                
-                # Filter for LATAM & Greater China
-                if country not in TARGET_REGIONS:
-                    continue
-                
-                # Add matched alert
-                account_id = alert.get("account", {}).get("id")
-                matched_alerts.append({
-                    "account_id": account_id,
-                    "campaign_id": campaign_id,
-                    "region": country,
-                    "country_name": COUNTRY_DISPLAY.get(country, country),
-                    "detected_time": alert.get("detected_at", "N/A"),
-                    "last_change": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                    "alert_type": alert.get("alert_type", "LP_CHANGE"),
-                })
+            cursor.execute(sql, unique_project_ids)
+            results = cursor.fetchall()
+            
+            log_message(f"📊 Batch query returned {len(results)} matching records")
+            
+            # Group results by project_id for fast lookup
+            for result in results:
+                project_id = result["project_id"]
+                if project_id not in project_data:
+                    project_data[project_id] = []
+                project_data[project_id].append(result)
         
         connection.close()
-        log_message(f"✅ Matched {len(matched_alerts)} alerts to target regions")
-        return matched_alerts
-    
+        
     except MySQLError as e:
-        log_message(f"❌ Database error during matching: {str(e)}")
-        raise
+        log_message(f"❌ Database error: {str(e)}")
+        return []
+    except Exception as e:
+        log_message(f"❌ Error in batch query: {str(e)}")
+        return []
+    
+    # Step 4: Match alerts with project data (fast lookup)
+    matching_alerts = []
+    
+    for alert in filtered_alerts:
+        project_id = alert["project_id"]
+        location_code = alert["location_code"]
+        location_name = alert["location_name"]
+        
+        log_message(f"  🔍 Processing alert: {alert.get('alert_id', 'Unknown')} from {location_code} ({location_name})")
+        
+        if project_id in project_data:
+            for result in project_data[project_id]:
+                campaign_id = result["campaign_id"]
+                account_id = result["account_id"]
+                country = result["country"]
+                publisher_name = result["publisher_name"]
+                locations = result["locations"]
+                region_type = result["region_type"]
+                
+                log_message(f"    ✅ MATCH! Found {region_type} campaign - Publisher: {publisher_name} ({country})")
+                
+                enhanced_alert = alert.copy()
+                enhanced_alert.update({
+                    "campaign_id": campaign_id,
+                    "account_id": account_id,
+                    "publisher_country": country,
+                    "publisher_name": publisher_name,
+                    "campaign_locations": locations,
+                    "region_type": region_type
+                })
+                
+                matching_alerts.append(enhanced_alert)
+        else:
+            log_message(f"    ❌ No target region data found for project {project_id}")
+    
+    log_message(f"✅ Found {len(matching_alerts)} matching alerts for target regions")
+    return matching_alerts
 
 
 def load_seen_alerts() -> Set[str]:
-    """Load previously sent alerts to prevent duplicates"""
+    """Load previously sent alerts"""
     seen_file = "seen_lp_alerts.json"
     
     if os.path.exists(seen_file):
@@ -296,7 +342,7 @@ def load_seen_alerts() -> Set[str]:
 
 
 def save_seen_alerts(seen: Set[str]) -> None:
-    """Save seen alerts to file"""
+    """Save seen alerts"""
     seen_file = "seen_lp_alerts.json"
     
     try:
@@ -306,11 +352,8 @@ def save_seen_alerts(seen: Set[str]) -> None:
         log_message(f"⚠️ Warning: Could not save seen alerts: {str(e)}")
 
 
-def deduplicate_alerts(
-    alerts: List[Dict[str, Any]],
-    seen: Set[str]
-) -> List[Dict[str, Any]]:
-    """Remove alerts that have already been sent"""
+def deduplicate_alerts(alerts: List[Dict[str, Any]], seen: Set[str]) -> List[Dict[str, Any]]:
+    """Remove already seen alerts"""
     
     new_alerts = []
     
@@ -324,42 +367,210 @@ def deduplicate_alerts(
     return new_alerts
 
 
+def send_alert_email(recipients: List[str], alerts: List[Dict[str, Any]], 
+                    cc_recipients: List[str] = None) -> bool:
+    """
+    Send email alert with LP changes
+    Email functionality preserved
+    """
+    
+    try:
+        # SMTP configuration
+        smtp_server = _env_or_fail("SMTP_SERVER")
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        smtp_user = os.getenv("SMTP_USER")
+        smtp_password = os.getenv("SMTP_PASSWORD")
+        
+        # Create message
+        msg = MIMEMultipart("alternative")
+        msg["From"] = EMAIL_SETTINGS["from_address"]
+        msg["To"] = ", ".join(recipients)
+        if cc_recipients:
+            msg["Cc"] = ", ".join(cc_recipients)
+        msg["Subject"] = EMAIL_SETTINGS["subject"]
+        
+        # Generate email content
+        if alerts:
+            html_content = generate_alert_email_html(alerts)
+        else:
+            html_content = generate_no_alerts_email_html()
+        
+        # Attach HTML content
+        html_part = MIMEText(html_content, "html")
+        msg.attach(html_part)
+        
+        # Send email
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            # Only use STARTTLS if port is 587 (standard TLS port)
+            if smtp_port == 587:
+                server.starttls()
+            
+            # Only login if both user and password are provided
+            if smtp_user and smtp_password:
+                server.login(smtp_user, smtp_password)
+            
+            all_recipients = recipients + (cc_recipients or [])
+            text = msg.as_string()
+            server.sendmail(smtp_user or EMAIL_SETTINGS["from_address"], all_recipients, text)
+        
+        log_message(f"✅ Email sent successfully to {len(recipients)} recipients")
+        return True
+        
+    except Exception as e:
+        log_message(f"❌ Failed to send email: {str(e)}")
+        return False
+
+
+def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
+    """Generate HTML email content for alerts"""
+    
+    # Group alerts by region
+    latam_alerts = [alert for alert in alerts if alert.get("region_type") == "LATAM"]
+    china_alerts = [alert for alert in alerts if alert.get("region_type") == "Greater China"]
+    
+    def create_alert_table(region_alerts, region_name, icon):
+        if not region_alerts:
+            return ""
+            
+        rows = ""
+        for alert in region_alerts:
+            account_id = alert.get("account_id", "Unknown")
+            publisher_country = alert.get("publisher_country", "Unknown")
+            campaign_id = alert.get("campaign_id", "Unknown")
+            campaign_locations = alert.get("campaign_locations", "Unknown")
+            
+            # Get proper trigger name
+            trigger_name = alert.get("trigger_type_name", "Unknown")
+            if trigger_name == "Unknown":
+                trigger_id = alert.get("trigger_type_id")
+                if trigger_id == 25:
+                    trigger_name = "LP CHANGE"
+                elif trigger_id == 35:
+                    trigger_name = "CREATIVE CHANGE"
+                elif trigger_id == 14:
+                    trigger_name = "AUTO REDIRECT"
+            
+            # Create proper GeoEdge alert link
+            alert_id = alert.get("alert_id", "")
+            project_id = alert.get("project_id", "")
+            
+            if alert_id and project_id:
+                # GeoEdge alert URL format - updated to match the working UI URL
+                geoedge_url = f"https://site.geoedge.com/analyticsv2/alertshistory/{alert_id}/1/off/"
+                alert_link = f'<a href="{geoedge_url}" target="_blank" style="color: #1a73e8; text-decoration: underline;">View Alert</a>'
+            else:
+                alert_link = '<span style="color: #999;">N/A</span>'
+            
+            rows += f"""
+            <tr>
+                <td style="padding: 8px; border: 1px solid #ddd;">{account_id}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">{publisher_country}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">{campaign_id}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">{campaign_locations}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">{trigger_name}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">{alert_link}</td>
+            </tr>
+            """
+        
+        return f"""
+        <div style="margin: 30px 0;">
+            <h3 style="color: #333; border-left: 4px solid #1a73e8; padding-left: 10px; margin-bottom: 15px;">
+                {icon} {region_name}
+            </h3>
+            <table style="width: 100%; border-collapse: collapse; margin: 10px 0;">
+                <thead>
+                    <tr style="background-color: #2c5282; color: white;">
+                        <th style="padding: 10px; border: 1px solid #ddd;">Account ID</th>
+                        <th style="padding: 10px; border: 1px solid #ddd;">Country</th>
+                        <th style="padding: 10px; border: 1px solid #ddd;">Campaign ID</th>
+                        <th style="padding: 10px; border: 1px solid #ddd;">Target Locations</th>
+                        <th style="padding: 10px; border: 1px solid #ddd;">Alert Type</th>
+                        <th style="padding: 10px; border: 1px solid #ddd;">Alert Link</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows}
+                </tbody>
+            </table>
+        </div>
+        """
+    
+    latam_table = create_alert_table(latam_alerts, "LATAM Accounts", "🌎")
+    china_table = create_alert_table(china_alerts, "Greater China Accounts", "🔴")
+    
+    return f"""
+    <html>
+    <body>
+        <div style="font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto;">
+            <p>Hi team,</p>
+            <p>The following LP Changes, Creative Changes, and Auto-Redirect alerts were detected for campaigns targeting LATAM & Greater China:</p>
+            
+            {latam_table}
+            {china_table}
+            
+            <p style="color: #666; font-size: 12px; margin-top: 30px;">
+                Generated by Campaign Alerts System at {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+
+
+def generate_no_alerts_email_html() -> str:
+    """Generate HTML email content when no alerts found"""
+    
+    return f"""
+    <html>
+    <body>
+        <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px;">
+            <div style="background-color: #e8f5e8; border-left: 4px solid #4caf50; padding: 15px; margin: 20px 0;">
+                <p style="margin: 0; font-size: 16px; color: #2d5a2d;">
+                    ✓ No landing page change alerts were detected in the last 24 hours for English campaigns sourced from LATAM and Greater China.
+                </p>
+                <p style="margin: 10px 0 0 0; font-size: 14px; color: #4a7c4a;">
+                    This is a good sign! Your campaigns are operating normally.
+                </p>
+            </div>
+            
+            <p style="color: #666; font-size: 12px;">
+                Generated by Campaign Alerts System at {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+
+
 def main():
-    """Main alert checker"""
+    """Main alert checker with clean structure"""
     
     log_message("=" * 80)
-    log_message("🎯 LP ALERTS CHECKER - 24 HOURS")
+    log_message("🎯 GEOEDGE LP ALERTS CHECKER - CLEAN START")
     log_message("=" * 80)
     
     try:
-        # Step 1: Get English-targeting campaigns
-        english_campaigns = get_english_campaigns()
-        
-        # Step 2: Fetch LP alerts from API
-        alerts = fetch_lp_alerts_with_retry(hours=ALERT_CHECK_HOURS)
+        # Step 1: Fetch alerts from GeoEdge API
+        alerts = fetch_alerts_from_geoedge()
         
         if not alerts:
-            log_message("⚠️ No alerts from API")
+            log_message("⚠️ No alerts found from API")
             new_alerts = []
         else:
-            # Step 3: Match to publishers and filter regions
-            filtered_alerts = match_alerts_to_publishers(alerts, english_campaigns)
+            log_message(f"✅ Found {len(alerts)} alerts from API")
+            
+            # Step 2: Process alerts to find target regions
+            filtered_alerts = process_alerts_to_target_regions(alerts)
             
             if not filtered_alerts:
                 log_message("⚠️ No alerts match target regions (LATAM + Greater China)")
                 new_alerts = []
             else:
-                # Step 4: Deduplicate
+                # Step 3: Deduplicate
                 seen = load_seen_alerts()
                 new_alerts = deduplicate_alerts(filtered_alerts, seen)
-                
-                if not new_alerts:
-                    log_message("⚠️ No new alerts (all were already seen)")
-                    new_alerts = []
-                else:
-                    seen = load_seen_alerts()
         
-        # Step 5: Send email (even if no alerts)
+        # Step 4: Send email (even if no new alerts)
         recipients = os.getenv("RECIPIENTS", "").strip()
         if not recipients:
             log_message("⚠️ No RECIPIENTS configured in .env")

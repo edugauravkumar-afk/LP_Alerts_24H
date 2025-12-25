@@ -39,15 +39,10 @@ REGION_LABEL = {
 # Email constants
 EMAIL_SETTINGS = {
     "from_address": "lp_change_alert@taboola.com",
-    "subject": "LP Changes LATAM & Greater China English Campaigns",
+    "subject": "🚨 LP/Creative/Auto-Redirect Alerts - LATAM & Greater China English Campaigns",
     "logo_url": "https://www.taboola.com/assets/taboola-logo-dark.png",
 }
 
 # Alert constants
 ALERT_CHECK_HOURS = 24
 ALERT_TYPE = "LP_CHANGE"
-
-# Timeout settings
-API_TIMEOUT_SECONDS = 180
-MAX_API_RETRIES = 3
-RETRY_BACKOFF_SECONDS = [10, 20, 30]  # 1st retry: 10s, 2nd retry: 20s, 3rd retry: 30s
