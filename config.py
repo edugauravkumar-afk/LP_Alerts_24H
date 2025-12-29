@@ -1,21 +1,26 @@
 """Configuration constants for 24-hour LP alerts"""
 
 # Regional codes
-ENGLISH_COUNTRIES = {"US", "GB", "CA", "AU", "NZ", "IE"}
-LATAM_COUNTRIES = {"MX", "AR", "BR", "CL", "CO", "PE"}
-GREATER_CHINA_COUNTRIES = {"CN", "HK", "TW", "MO"}
-TARGET_REGIONS = LATAM_COUNTRIES | GREATER_CHINA_COUNTRIES
+TARGET_LOCATIONS = {"US", "GB", "CA", "AU"}  # Countries campaigns should target
+LATAM_COUNTRIES = {"MX", "AR", "BR", "CL", "CO", "PE"}  # Publisher regions
+GREATER_CHINA_COUNTRIES = {"CN", "HK", "TW", "MO"}  # Publisher regions
+PUBLISHER_REGIONS = LATAM_COUNTRIES | GREATER_CHINA_COUNTRIES  # Where publishers are from
 
 # Display names
 COUNTRY_DISPLAY = {
-    # LATAM
+    # Target Locations (campaign targeting)
+    "US": "🇺🇸 United States",
+    "GB": "🇬🇧 United Kingdom", 
+    "CA": "🇨🇦 Canada",
+    "AU": "🇦🇺 Australia",
+    # LATAM Publisher Regions
     "MX": "🇲🇽 Mexico",
     "AR": "🇦🇷 Argentina",
     "BR": "🇧🇷 Brazil",
     "CL": "🇨🇱 Chile",
     "CO": "🇨🇴 Colombia",
     "PE": "🇵🇪 Peru",
-    # Greater China
+    # Greater China Publisher Regions
     "CN": "🇨🇳 China",
     "HK": "🇭🇰 Hong Kong",
     "TW": "🇹🇼 Taiwan",
@@ -39,7 +44,7 @@ REGION_LABEL = {
 # Email constants
 EMAIL_SETTINGS = {
     "from_address": "lp_change_alert@taboola.com",
-    "subject": "🚨 LP/Creative/Auto-Redirect Alerts - LATAM & Greater China English Campaigns",
+    "subject": "🚨 LP/Creative/Auto-Redirect Alerts - LATAM & Greater China Publishers → US/GB/CA/AU Campaigns",
     "logo_url": "https://www.taboola.com/assets/taboola-logo-dark.png",
 }
 
