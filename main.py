@@ -18,9 +18,8 @@ from dotenv import load_dotenv
 
 # Import local modules
 from config import (
-    ENGLISH_COUNTRIES, LATAM_COUNTRIES, GREATER_CHINA_COUNTRIES,
-    TARGET_REGIONS, ALERT_CHECK_HOURS,
-    EMAIL_SETTINGS, COUNTRY_DISPLAY
+    TARGET_LOCATIONS, PUBLISHER_REGIONS, LATAM_COUNTRIES, GREATER_CHINA_COUNTRIES,
+    ALERT_CHECK_HOURS, EMAIL_SETTINGS, COUNTRY_DISPLAY
 )
 
 load_dotenv()
@@ -86,7 +85,7 @@ def fetch_alerts_from_geoedge() -> List[Dict[str, Any]]:
     trigger_types = {
         "25": "LP Change",
         "35": "Creative Change", 
-        "14": "Auto Redirect"  # Common auto redirect trigger ID
+        "32": "Auto Redirect"  # Correct auto redirect trigger ID (was 14, now 32)
     }
     
     target_countries = "US,GB,CA,AU"
@@ -184,17 +183,19 @@ def fetch_alerts_from_geoedge() -> List[Dict[str, Any]]:
 
 def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Process alerts and find campaigns targeting LATAM & Greater China regions
+    Process alerts and find campaigns from LATAM & Greater China publishers targeting US/GB/CA/AU
     Optimized with batch queries for better performance
     """
-    
-    log_message(f"🏢 Processing {len(alerts)} alerts to find target region campaigns")
+
+    log_message(
+        f"🏢 Processing {len(alerts)} alerts to find LATAM/Greater China publishers targeting {', '.join(sorted(TARGET_LOCATIONS))}"
+    )
     
     if not alerts:
         return []
     
     # Step 1: Filter alerts by target countries (fast, no DB queries)
-    target_countries = {"US", "GB", "CA", "AU"}
+    target_countries = TARGET_LOCATIONS
     filtered_alerts = []
     
     for alert in alerts:
@@ -202,10 +203,16 @@ def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[
         if not location:
             continue
             
-        location_codes = list(location.keys())
-        if any(code in target_countries for code in location_codes):
-            location_code = list(location.keys())[0]
-            location_name = list(location.values())[0]
+        # Iterate all provided locations to avoid missing valid targets when the first entry is unrelated
+        location_code = None
+        location_name = None
+        for code, name in location.items():
+            if code in target_countries:
+                location_code = code
+                location_name = name
+                break
+
+        if location_code:
             
             # Extract project info
             project_name_dict = alert.get("project_name", {})
@@ -228,7 +235,9 @@ def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[
             })
             filtered_alerts.append(enhanced_alert)
     
-    log_message(f"📊 Filtered to {len(filtered_alerts)} alerts from target countries")
+    log_message(
+        f"📊 Filtered to {len(filtered_alerts)} alerts from target locations ({', '.join(sorted(TARGET_LOCATIONS))})"
+    )
     
     if not filtered_alerts:
         return []
@@ -308,6 +317,21 @@ def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[
                 locations = result["locations"]
                 region_type = result["region_type"]
                 
+                # Check if campaign targets our desired locations (US, GB, CA, AU)
+                # Handle both "US,CA,GB,DE" and "US, CA, GB, DE" formats
+                if locations:
+                    # Split by comma and strip whitespace from each country code
+                    campaign_target_countries = set(country.strip() for country in locations.split(","))
+                else:
+                    campaign_target_countries = set()
+                
+                # Only include campaigns that target at least one of our specified countries
+                if campaign_target_countries and not campaign_target_countries.intersection(TARGET_LOCATIONS):
+                    log_message(
+                        f"    ❌ SKIPPED! Campaign doesn't target any of our focus countries ({', '.join(sorted(TARGET_LOCATIONS))})"
+                    )
+                    continue
+                
                 log_message(f"    ✅ MATCH! Found {region_type} campaign - Publisher: {publisher_name} ({country})")
                 
                 enhanced_alert = alert.copy()
@@ -325,7 +349,10 @@ def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[
         else:
             log_message(f"    ❌ No target region data found for project {project_id}")
     
-    log_message(f"✅ Found {len(matching_alerts)} matching alerts for target regions")
+    target_locations_str = ", ".join(sorted(target_countries))
+    log_message(
+        f"✅ Found {len(matching_alerts)} LATAM/Greater China campaigns targeting {target_locations_str}"
+    )
     return matching_alerts
 
 
@@ -406,11 +433,12 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
             trigger_name = alert.get("trigger_type_name", "Unknown")
             if trigger_name == "Unknown":
                 trigger_id = alert.get("trigger_type_id")
-                if trigger_id == 25:
+                trigger_id_str = str(trigger_id) if trigger_id is not None else ""
+                if trigger_id_str == "25":
                     trigger_name = "LP CHANGE"
-                elif trigger_id == 35:
+                elif trigger_id_str == "35":
                     trigger_name = "CREATIVE CHANGE"
-                elif trigger_id == 14:
+                elif trigger_id_str == "32":
                     trigger_name = "AUTO REDIRECT"
             
             # Create unique key for grouping by account + alert type
@@ -423,23 +451,26 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
                     "publisher_country": publisher_country,
                     "campaign_locations": campaign_locations,
                     "trigger_name": trigger_name,
-                    "campaign_ids": [],
-                    "alert_links": []
+                    "campaign_data": {},  # Store campaign_id -> list of alert_details_urls mapping
                 }
             
-            # Add campaign ID and alert link to the group
+            # Add campaign ID and its alert URL to the group
             campaign_id = alert.get("campaign_id", "Unknown")
-            if campaign_id not in grouped_alerts[group_key]["campaign_ids"]:
-                grouped_alerts[group_key]["campaign_ids"].append(campaign_id)
+            alert_details_url = alert.get("alert_details_url", "")
             
-            # Create alert link
-            alert_id = alert.get("alert_id", "")
-            project_id = alert.get("project_id", "")
-            if alert_id and project_id:
-                geoedge_url = f"https://site.geoedge.com/analyticsv2/alertshistory/{alert_id}/1/off/"
-                alert_link = f'<a href="{geoedge_url}" target="_blank" style="color: #1a73e8; text-decoration: underline;">View</a>'
-                if alert_link not in grouped_alerts[group_key]["alert_links"]:
-                    grouped_alerts[group_key]["alert_links"].append(alert_link)
+            # Store all alert_details_urls for this campaign (list of URLs)
+            if campaign_id not in grouped_alerts[group_key]["campaign_data"]:
+                grouped_alerts[group_key]["campaign_data"][campaign_id] = []
+            
+            if alert_details_url and alert_details_url not in grouped_alerts[group_key]["campaign_data"][campaign_id]:
+                grouped_alerts[group_key]["campaign_data"][campaign_id].append(alert_details_url)
+            elif not alert_details_url:
+                # Fallback to generic alert history URL if alert_details_url is not available
+                alert_id = alert.get("alert_id", "")
+                if alert_id:
+                    geoedge_url = f"https://site.geoedge.com/analyticsv2/alertshistory/{alert_id}/1/off/"
+                    if geoedge_url not in grouped_alerts[group_key]["campaign_data"][campaign_id]:
+                        grouped_alerts[group_key]["campaign_data"][campaign_id].append(geoedge_url)
         
         # Generate rows from grouped data
         rows = ""
@@ -448,13 +479,31 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
             account_name = group_data.get("account_name", "Unknown")
             publisher_country = group_data["publisher_country"]
             campaign_locations = group_data["campaign_locations"]
+            
+            # Filter campaign locations to show only our focus countries (US, GB, CA, AU)
+            if campaign_locations:
+                # Handle both comma-separated formats: "US,CA,GB,DE" and "US, CA, GB, DE"
+                all_locations = set(loc.strip() for loc in campaign_locations.replace(" ", "").split(","))
+                focus_locations = all_locations.intersection(TARGET_LOCATIONS)
+                # Always show only our focus countries, never show DE or other countries
+                campaign_locations_filtered = ", ".join(sorted(focus_locations)) if focus_locations else "N/A"
+            else:
+                campaign_locations_filtered = "N/A"
+            
             trigger_name = group_data["trigger_name"]
             
-            # Join campaign IDs with commas (convert to strings first)
-            campaign_ids_str = ", ".join(str(cid) for cid in group_data["campaign_ids"])
+            # Create clickable campaign IDs with alert_details_url links
+            campaign_links = []
+            for campaign_id, alert_urls in group_data["campaign_data"].items():
+                if alert_urls and len(alert_urls) > 0:
+                    # Use the first alert URL for the campaign ID link
+                    primary_url = alert_urls[0]
+                    campaign_link = f'<a href="{primary_url}" target="_blank" style="color: #1a73e8; text-decoration: underline;">{campaign_id}</a>'
+                else:
+                    campaign_link = str(campaign_id)  # No link if no URLs
+                campaign_links.append(campaign_link)
             
-            # Join alert links with " | " separator
-            alert_links_str = " | ".join(group_data["alert_links"]) if group_data["alert_links"] else '<span style="color: #999;">N/A</span>'
+            campaign_ids_str = ", ".join(campaign_links)
             
             rows += f"""
             <tr>
@@ -462,9 +511,8 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
                 <td style="padding: 8px; border: 1px solid #ddd;">{account_name}</td>
                 <td style="padding: 8px; border: 1px solid #ddd;">{publisher_country}</td>
                 <td style="padding: 8px; border: 1px solid #ddd;">{campaign_ids_str}</td>
-                <td style="padding: 8px; border: 1px solid #ddd;">{campaign_locations}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">{campaign_locations_filtered}</td>
                 <td style="padding: 8px; border: 1px solid #ddd;">{trigger_name}</td>
-                <td style="padding: 8px; border: 1px solid #ddd;">{alert_links_str}</td>
             </tr>
             """
         
@@ -482,7 +530,6 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
                         <th style="padding: 10px; border: 1px solid #ddd;">Campaign IDs</th>
                         <th style="padding: 10px; border: 1px solid #ddd;">Target Locations</th>
                         <th style="padding: 10px; border: 1px solid #ddd;">Alert Type</th>
-                        <th style="padding: 10px; border: 1px solid #ddd;">Alert Links</th>
                     </tr>
                 </thead>
                 <tbody>
