@@ -6,12 +6,15 @@ Database queries and email alerts for LP changes
 
 import os
 import sys
+import csv
+import io
 import smtplib
 import requests
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 import pymysql
 from pymysql import MySQLError
 from dotenv import load_dotenv
@@ -378,15 +381,24 @@ def send_alert_email(recipients: List[str], alerts: List[Dict[str, Any]],
             msg["Cc"] = ", ".join(cc_recipients)
         msg["Subject"] = EMAIL_SETTINGS["subject"]
         
-        # Generate email content
+        # Generate email content (and CSV report if alerts exist)
+        csv_content = None
+        csv_filename = None
         if alerts:
-            html_content = generate_alert_email_html(alerts)
+            html_content, csv_content, csv_filename = generate_alert_email_html(alerts)
         else:
             html_content = generate_no_alerts_email_html()
         
         # Attach HTML content
         html_part = MIMEText(html_content, "html")
         msg.attach(html_part)
+        
+        # Attach CSV report when available so email clients can download reliably
+        if csv_content and csv_filename:
+            csv_part = MIMEApplication(csv_content.encode("utf-8"), _subtype="csv")
+            csv_part.add_header("Content-Disposition", "attachment", filename=csv_filename)
+            csv_part.add_header("Content-ID", "<lp-alerts-report>")
+            msg.attach(csv_part)
         
         # Send email
         with smtplib.SMTP(smtp_server, smtp_port) as server:
@@ -410,12 +422,36 @@ def send_alert_email(recipients: List[str], alerts: List[Dict[str, Any]],
         return False
 
 
-def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
-    """Generate HTML email content for alerts"""
+def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> Tuple[str, Optional[str], Optional[str]]:
+    """Generate HTML email content for alerts and CSV attachment data."""
     
     # Group alerts by region
     latam_alerts = [alert for alert in alerts if alert.get("region_type") == "LATAM"]
     china_alerts = [alert for alert in alerts if alert.get("region_type") == "Greater China"]
+    rows_for_csv: List[Dict[str, Any]] = []
+    csv_headers = [
+        "Region",
+        "Account ID",
+        "Account Name",
+        "Publisher Country",
+        "Campaign ID",
+        "Alert Link",
+        "Target Locations",
+        "Alert Type",
+    ]
+    
+    def build_report_download_button(has_data: bool) -> str:
+        if not has_data:
+            return ""
+        return """
+            <div style=\"margin: 20px 0;\">
+                <a href=\"cid:lp-alerts-report\" 
+                   style=\"display: inline-block; padding: 12px 20px; background-color: #1a73e8; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;\">
+                    ⬇️ Download Full Report
+                </a>
+                <p style=\"margin: 8px 0 0 0; color: #444; font-size: 12px;\">Button opens the attached CSV report.</p>
+            </div>
+        """
     
     def create_alert_table(region_alerts, region_name, icon):
         if not region_alerts:
@@ -492,29 +528,36 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
             
             trigger_name = group_data["trigger_name"]
             
-            # Create clickable campaign IDs with alert_details_url links
-            campaign_links = []
             for campaign_id, alert_urls in group_data["campaign_data"].items():
-                if alert_urls and len(alert_urls) > 0:
-                    # Use the first alert URL for the campaign ID link
-                    primary_url = alert_urls[0]
-                    campaign_link = f'<a href="{primary_url}" target="_blank" style="color: #1a73e8; text-decoration: underline;">{campaign_id}</a>'
+                primary_url = alert_urls[0] if alert_urls else ""
+                if primary_url:
+                    # Link column shows the first alert URL available for the campaign
+                    link_cell = f'<a href="{primary_url}" target="_blank" style="color: #1a73e8; text-decoration: underline;">View Alert</a>'
                 else:
-                    campaign_link = str(campaign_id)  # No link if no URLs
-                campaign_links.append(campaign_link)
-            
-            campaign_ids_str = ", ".join(campaign_links)
-            
-            rows += f"""
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;">{account_id}</td>
-                <td style="padding: 8px; border: 1px solid #ddd;">{account_name}</td>
-                <td style="padding: 8px; border: 1px solid #ddd;">{publisher_country}</td>
-                <td style="padding: 8px; border: 1px solid #ddd;">{campaign_ids_str}</td>
-                <td style="padding: 8px; border: 1px solid #ddd;">{campaign_locations_filtered}</td>
-                <td style="padding: 8px; border: 1px solid #ddd;">{trigger_name}</td>
-            </tr>
-            """
+                    link_cell = "N/A"
+
+                rows_for_csv.append({
+                    "Region": region_name,
+                    "Account ID": account_id,
+                    "Account Name": account_name,
+                    "Publisher Country": publisher_country,
+                    "Campaign ID": campaign_id,
+                    "Alert Link": primary_url,
+                    "Target Locations": campaign_locations_filtered,
+                    "Alert Type": trigger_name,
+                })
+
+                rows += f"""
+                <tr>
+                    <td style="padding: 8px; border: 1px solid #ddd;">{account_id}</td>
+                    <td style="padding: 8px; border: 1px solid #ddd;">{account_name}</td>
+                    <td style="padding: 8px; border: 1px solid #ddd;">{publisher_country}</td>
+                    <td style="padding: 8px; border: 1px solid #ddd;">{campaign_id}</td>
+                    <td style="padding: 8px; border: 1px solid #ddd;">{link_cell}</td>
+                    <td style="padding: 8px; border: 1px solid #ddd;">{campaign_locations_filtered}</td>
+                    <td style="padding: 8px; border: 1px solid #ddd;">{trigger_name}</td>
+                </tr>
+                """
         
         return f"""
         <div style="margin: 30px 0;">
@@ -527,7 +570,8 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
                         <th style="padding: 10px; border: 1px solid #ddd;">Account ID</th>
                         <th style="padding: 10px; border: 1px solid #ddd;">Account Name</th>
                         <th style="padding: 10px; border: 1px solid #ddd;">Country</th>
-                        <th style="padding: 10px; border: 1px solid #ddd;">Campaign IDs</th>
+                        <th style="padding: 10px; border: 1px solid #ddd;">Campaign ID</th>
+                        <th style="padding: 10px; border: 1px solid #ddd;">Link</th>
                         <th style="padding: 10px; border: 1px solid #ddd;">Target Locations</th>
                         <th style="padding: 10px; border: 1px solid #ddd;">Alert Type</th>
                     </tr>
@@ -541,13 +585,27 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
     
     latam_table = create_alert_table(latam_alerts, "LATAM Accounts", "🌎")
     china_table = create_alert_table(china_alerts, "Greater China Accounts", "🔴")
+
+    csv_content: Optional[str] = None
+    csv_filename: Optional[str] = None
+    if rows_for_csv:
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=csv_headers)
+        writer.writeheader()
+        writer.writerows(rows_for_csv)
+        csv_content = buffer.getvalue()
+        buffer.close()
+        csv_filename = f"lp_alerts_report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.csv"
     
-    return f"""
+    download_button_html = build_report_download_button(bool(rows_for_csv))
+    
+    html_content = f"""
     <html>
     <body>
         <div style="font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto;">
             <p>Hi team,</p>
             <p>The following LP Changes, Creative Changes, and Auto-Redirect alerts were detected for campaigns targeting LATAM & Greater China:</p>
+            {download_button_html}
             
             {latam_table}
             {china_table}
@@ -559,6 +617,8 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> str:
     </body>
     </html>
     """
+    
+    return html_content, csv_content, csv_filename
 
 
 def generate_no_alerts_email_html() -> str:
