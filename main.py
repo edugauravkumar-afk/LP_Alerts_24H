@@ -679,7 +679,23 @@ def _format_target_csv(target_locations: set[str]) -> str:
     return ",".join(sorted(target_locations))
 
 
-def _run_alert_flow(flow_name: str, target_locations: set[str], email_subject: str) -> None:
+def _parse_recipients(env_var: str, fallback_env_var: Optional[str] = None) -> List[str]:
+    """Return a cleaned recipient list from env var, optionally falling back."""
+
+    raw = os.getenv(env_var, "").strip()
+    if not raw and fallback_env_var:
+        raw = os.getenv(fallback_env_var, "").strip()
+    return [r.strip() for r in raw.split(",") if r.strip()]
+
+
+def _run_alert_flow(
+    flow_name: str,
+    target_locations: set[str],
+    email_subject: str,
+    recipients_env: str,
+    cc_env: str,
+    fallback_recipients_env: Optional[str] = None,
+) -> None:
     """Execute full fetch→process→email flow for a target set."""
 
     try:
@@ -707,14 +723,12 @@ def _run_alert_flow(flow_name: str, target_locations: set[str], email_subject: s
                 filtered_alerts = []
 
         # Step 3: Send email (even if no alerts)
-        recipients = os.getenv("RECIPIENTS", "").strip()
-        if not recipients:
-            log_message("⚠️ No RECIPIENTS configured in .env")
+        recipient_list = _parse_recipients(recipients_env, fallback_recipients_env)
+        if not recipient_list:
+            log_message(f"⚠️ No {recipients_env} configured in .env")
             return
 
-        recipient_list = [r.strip() for r in recipients.split(",") if r.strip()]
-        cc_recipients = os.getenv("CC_RECIPIENTS", "").strip()
-        cc_list = [r.strip() for r in cc_recipients.split(",") if r.strip()] if cc_recipients else []
+        cc_list = _parse_recipients(cc_env)
 
         log_message(f"📧 [{flow_name}] Sending email to: {', '.join(recipient_list)}")
         if cc_list:
@@ -740,18 +754,24 @@ def _run_alert_flow(flow_name: str, target_locations: set[str], email_subject: s
 
 
 def main():
-    """Run both primary (US/GB/CA/AU) and ES/IT flows with shared recipients."""
+    """Run primary (US/GB/CA/AU) and ES/IT flows with per-flow recipients."""
 
     _run_alert_flow(
         flow_name="Primary US/GB/CA/AU",
         target_locations=TARGET_LOCATIONS,
         email_subject=EMAIL_SETTINGS["subject"],
+        recipients_env="RECIPIENTS_PRIMARY",
+        cc_env="CC_RECIPIENTS_PRIMARY",
+        fallback_recipients_env="RECIPIENTS",
     )
 
     _run_alert_flow(
         flow_name="ES/IT",
         target_locations=TARGET_LOCATIONS_ESIT,
         email_subject=EMAIL_SETTINGS.get("subject_esit", "🚨 LP/Creative/Auto-Redirect Alerts - LATAM & Greater China Publishers → ES/IT Campaigns"),
+        recipients_env="RECIPIENTS_ESIT",
+        cc_env="CC_RECIPIENTS_ESIT",
+        fallback_recipients_env="RECIPIENTS",
     )
 
 
