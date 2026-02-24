@@ -21,8 +21,14 @@ from dotenv import load_dotenv
 
 # Import local modules
 from config import (
-    TARGET_LOCATIONS, PUBLISHER_REGIONS, LATAM_COUNTRIES, GREATER_CHINA_COUNTRIES,
-    ALERT_CHECK_HOURS, EMAIL_SETTINGS, COUNTRY_DISPLAY
+    TARGET_LOCATIONS,
+    TARGET_LOCATIONS_ESIT,
+    PUBLISHER_REGIONS,
+    LATAM_COUNTRIES,
+    GREATER_CHINA_COUNTRIES,
+    ALERT_CHECK_HOURS,
+    EMAIL_SETTINGS,
+    COUNTRY_DISPLAY,
 )
 
 load_dotenv()
@@ -68,105 +74,109 @@ def get_database_connection():
     )
 
 
-def fetch_alerts_from_geoedge() -> List[Dict[str, Any]]:
+def fetch_alerts_from_geoedge(
+    target_countries_csv: str | None = None,
+    flow_label: str = "Primary",
+) -> List[Dict[str, Any]]:
     """
     Fetch alerts for 3 trigger types: LP Change, Creative Change, Auto Redirect
-    Targeting countries: US, GB, CA, AU
+    Target countries provided as CSV string.
     """
-    
+
+    target_countries_csv = target_countries_csv or ",".join(sorted(TARGET_LOCATIONS))
+
     api_key = _env_or_fail("GEOEDGE_API_KEY")
     base_url = "https://api.geoedge.com/rest/analytics/v3/alerts/history"
-    
+
     headers = {
         "Authorization": api_key,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
-    
-    log_message(f"🔍 Fetching alerts for 3 trigger types from target countries")
-    
+
+    log_message(f"🔍 [{flow_label}] Fetching alerts for 3 trigger types targeting: {target_countries_csv}")
+
     # Define trigger types: LP Change, Creative Change, Auto Redirect
     trigger_types = {
         "25": "LP Change",
-        "35": "Creative Change", 
-        "32": "Auto Redirect"  # Correct auto redirect trigger ID (was 14, now 32)
+        "35": "Creative Change",
+        "32": "Auto Redirect",  # Correct auto redirect trigger ID (was 14, now 32)
     }
-    
-    target_countries = "US,GB,CA,AU"
+
     all_alerts = []
-    
+
     # Try each trigger type separately
     for trigger_id, trigger_name in trigger_types.items():
-        log_message(f"📡 Fetching {trigger_name} alerts (trigger_type_id={trigger_id})")
-        
+        log_message(f"📡 [{flow_label}] Fetching {trigger_name} alerts (trigger_type_id={trigger_id})")
+
         params = {
             "alert_id": "02d0f59e8dc68664c18d243b01ec0f55",
             "trigger_type_id": trigger_id,
             "full_raw": 1,
-            "location_id": target_countries
+            "location_id": target_countries_csv,
         }
-        
+
         try:
             log_message(f"   URL: {base_url}")
             log_message(f"   Params: {params}")
-            
+
             response = requests.get(base_url, headers=headers, params=params, timeout=60)
-            
+
             log_message(f"   Status Code: {response.status_code}")
-            
+
             if response.status_code == 200:
                 data = response.json()
-                
+
                 # Check different possible alert locations in response
                 alerts = []
                 if "alerts" in data:
                     alerts = data["alerts"]
                 elif "response" in data and "alerts" in data["response"]:
                     alerts = data["response"]["alerts"]
-                
+
                 if alerts:
                     log_message(f"   ✅ Found {len(alerts)} {trigger_name} alerts")
-                    
+
                     # Add trigger type info to each alert
                     for alert in alerts:
                         alert["trigger_type_name"] = trigger_name
-                    
+
                     all_alerts.extend(alerts)
                 else:
                     log_message(f"   ⚠️ No {trigger_name} alerts found")
-            
+
             else:
                 log_message(f"   ❌ {trigger_name} API failed with status {response.status_code}")
-        
+
         except Exception as e:
             log_message(f"   ❌ {trigger_name} API error: {str(e)}")
-    
+
     if all_alerts:
-        log_message(f"✅ TOTAL SUCCESS: Found {len(all_alerts)} alerts across all trigger types")
-        
+        log_message(f"✅ [{flow_label}] TOTAL SUCCESS: Found {len(all_alerts)} alerts across all trigger types")
+
         # Show breakdown by trigger type
         trigger_counts = {}
         location_counts = {}
-        
+
         for alert in all_alerts:
             trigger_name = alert.get("trigger_type_name", "Unknown")
             trigger_counts[trigger_name] = trigger_counts.get(trigger_name, 0) + 1
-            
+
             location = alert.get("location", {})
             for country_code, country_name in location.items():
                 location_counts[f"{country_code} ({country_name})"] = location_counts.get(f"{country_code} ({country_name})", 0) + 1
-        
-        log_message(f"📊 BREAKDOWN BY TRIGGER TYPE:")
+
+        log_message("📊 BREAKDOWN BY TRIGGER TYPE:")
         for trigger_name, count in trigger_counts.items():
             log_message(f"   {trigger_name}: {count} alerts")
-        
-        log_message(f"📍 BREAKDOWN BY LOCATION:")
+
+        log_message("📍 BREAKDOWN BY LOCATION:")
         for location, count in location_counts.items():
             log_message(f"   {location}: {count} alerts")
-        
+
         # Show sample alert structure
-        log_message(f"📋 SAMPLE ALERT DATA:")
-        log_message(f"=" * 60)
-        
+        log_message("📋 SAMPLE ALERT DATA:")
+        log_message("=" * 60)
+
         if len(all_alerts) > 0:
             alert = all_alerts[0]
             log_message(f"Alert Keys: {list(alert.keys())}")
@@ -175,30 +185,33 @@ def fetch_alerts_from_geoedge() -> List[Dict[str, Any]]:
             log_message(f"Alert Name: {alert.get('alert_name')}")
             log_message(f"Event Time: {alert.get('event_datetime')}")
             log_message(f"Project Name: {alert.get('project_name')}")
-        
-        log_message(f"=" * 60)
+
+        log_message("=" * 60)
         return all_alerts
-    
-    else:
-        log_message(f"❌ No alerts found for any trigger type")
-        return []
+
+    log_message("❌ No alerts found for any trigger type")
+    return []
 
 
-def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def process_alerts_to_target_regions(
+    alerts: List[Dict[str, Any]],
+    target_countries: set[str] | None = None,
+) -> List[Dict[str, Any]]:
     """
-    Process alerts and find campaigns from LATAM & Greater China publishers targeting US/GB/CA/AU
-    Optimized with batch queries for better performance
+    Process alerts and find campaigns from LATAM & Greater China publishers targeting provided countries.
+    Optimized with batch queries for better performance.
     """
+
+    target_countries = target_countries or TARGET_LOCATIONS
 
     log_message(
-        f"🏢 Processing {len(alerts)} alerts to find LATAM/Greater China publishers targeting {', '.join(sorted(TARGET_LOCATIONS))}"
+        f"🏢 Processing {len(alerts)} alerts to find LATAM/Greater China publishers targeting {', '.join(sorted(target_countries))}"
     )
-    
+
     if not alerts:
         return []
-    
+
     # Step 1: Filter alerts by target countries (fast, no DB queries)
-    target_countries = TARGET_LOCATIONS
     filtered_alerts = []
     
     for alert in alerts:
@@ -239,7 +252,7 @@ def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[
             filtered_alerts.append(enhanced_alert)
     
     log_message(
-        f"📊 Filtered to {len(filtered_alerts)} alerts from target locations ({', '.join(sorted(TARGET_LOCATIONS))})"
+        f"📊 Filtered to {len(filtered_alerts)} alerts from target locations ({', '.join(sorted(target_countries))})"
     )
     
     if not filtered_alerts:
@@ -329,9 +342,9 @@ def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[
                     campaign_target_countries = set()
                 
                 # Only include campaigns that target at least one of our specified countries
-                if campaign_target_countries and not campaign_target_countries.intersection(TARGET_LOCATIONS):
+                if campaign_target_countries and not campaign_target_countries.intersection(target_countries):
                     log_message(
-                        f"    ❌ SKIPPED! Campaign doesn't target any of our focus countries ({', '.join(sorted(TARGET_LOCATIONS))})"
+                        f"    ❌ SKIPPED! Campaign doesn't target any of our focus countries ({', '.join(sorted(target_countries))})"
                     )
                     continue
                 
@@ -359,71 +372,81 @@ def process_alerts_to_target_regions(alerts: List[Dict[str, Any]]) -> List[Dict[
     return matching_alerts
 
 
-def send_alert_email(recipients: List[str], alerts: List[Dict[str, Any]], 
-                    cc_recipients: List[str] = None) -> bool:
-    """
-    Send email alert with LP changes
-    Email functionality preserved
-    """
-    
+def send_alert_email(
+    recipients: List[str],
+    alerts: List[Dict[str, Any]],
+    target_locations: set[str],
+    target_label: str,
+    cc_recipients: List[str] | None = None,
+    subject: str | None = None,
+) -> bool:
+    """Send email alert with LP changes for the given target set."""
+
     try:
         # SMTP configuration
         smtp_server = _env_or_fail("SMTP_SERVER")
         smtp_port = int(os.getenv("SMTP_PORT", "587"))
         smtp_user = os.getenv("SMTP_USER")
         smtp_password = os.getenv("SMTP_PASSWORD")
-        
+
         # Create message
         msg = MIMEMultipart("alternative")
         msg["From"] = EMAIL_SETTINGS["from_address"]
         msg["To"] = ", ".join(recipients)
         if cc_recipients:
             msg["Cc"] = ", ".join(cc_recipients)
-        msg["Subject"] = EMAIL_SETTINGS["subject"]
-        
+        msg["Subject"] = subject or EMAIL_SETTINGS["subject"]
+
         # Generate email content (and CSV report if alerts exist)
         csv_content = None
         csv_filename = None
         if alerts:
-            html_content, csv_content, csv_filename = generate_alert_email_html(alerts)
+            html_content, csv_content, csv_filename = generate_alert_email_html(alerts, target_locations, target_label)
         else:
-            html_content = generate_no_alerts_email_html()
-        
+            html_content = generate_no_alerts_email_html(target_label)
+
         # Attach HTML content
         html_part = MIMEText(html_content, "html")
         msg.attach(html_part)
-        
+
         # Attach CSV report when available so email clients can download reliably
         if csv_content and csv_filename:
             csv_part = MIMEApplication(csv_content.encode("utf-8"), _subtype="csv")
             csv_part.add_header("Content-Disposition", "attachment", filename=csv_filename)
             csv_part.add_header("Content-ID", "<lp-alerts-report>")
             msg.attach(csv_part)
-        
+
         # Send email
         with smtplib.SMTP(smtp_server, smtp_port) as server:
             # Only use STARTTLS if port is 587 (standard TLS port)
             if smtp_port == 587:
                 server.starttls()
-            
+
             # Only login if both user and password are provided
             if smtp_user and smtp_password:
                 server.login(smtp_user, smtp_password)
-            
+
             all_recipients = recipients + (cc_recipients or [])
             text = msg.as_string()
             server.sendmail(smtp_user or EMAIL_SETTINGS["from_address"], all_recipients, text)
-        
+
         log_message(f"✅ Email sent successfully to {len(recipients)} recipients")
         return True
-        
+
     except Exception as e:
         log_message(f"❌ Failed to send email: {str(e)}")
         return False
 
 
-def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> Tuple[str, Optional[str], Optional[str]]:
+def generate_alert_email_html(
+    alerts: List[Dict[str, Any]],
+    target_locations: set[str] | None = None,
+    target_label: str | None = None,
+) -> Tuple[str, Optional[str], Optional[str]]:
     """Generate HTML email content for alerts and CSV attachment data."""
+
+    target_locations = target_locations or TARGET_LOCATIONS
+    target_label = target_label or "/".join(sorted(target_locations))
     
     # Group alerts by region
     latam_alerts = [alert for alert in alerts if alert.get("region_type") == "LATAM"]
@@ -516,11 +539,11 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> Tuple[str, Option
             publisher_country = group_data["publisher_country"]
             campaign_locations = group_data["campaign_locations"]
             
-            # Filter campaign locations to show only our focus countries (US, GB, CA, AU)
+            # Filter campaign locations to show only our focus countries for this flow
             if campaign_locations:
                 # Handle both comma-separated formats: "US,CA,GB,DE" and "US, CA, GB, DE"
                 all_locations = set(loc.strip() for loc in campaign_locations.replace(" ", "").split(","))
-                focus_locations = all_locations.intersection(TARGET_LOCATIONS)
+                focus_locations = all_locations.intersection(target_locations)
                 # Always show only our focus countries, never show DE or other countries
                 campaign_locations_filtered = ", ".join(sorted(focus_locations)) if focus_locations else "N/A"
             else:
@@ -604,7 +627,7 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> Tuple[str, Option
     <body>
         <div style="font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto;">
             <p>Hi team,</p>
-            <p>The following LP Changes, Creative Changes, and Auto-Redirect alerts were detected for campaigns targeting LATAM & Greater China:</p>
+            <p>The following LP Changes, Creative Changes, and Auto-Redirect alerts were detected for campaigns targeting LATAM & Greater China ({target_label}):</p>
             {download_button_html}
             
             {latam_table}
@@ -621,22 +644,24 @@ def generate_alert_email_html(alerts: List[Dict[str, Any]]) -> Tuple[str, Option
     return html_content, csv_content, csv_filename
 
 
-def generate_no_alerts_email_html() -> str:
-    """Generate HTML email content when no alerts found"""
-    
+def generate_no_alerts_email_html(target_label: str | None = None) -> str:
+    """Generate HTML email content when no alerts found."""
+
+    target_label = target_label or "/".join(sorted(TARGET_LOCATIONS))
+
     return f"""
     <html>
     <body>
         <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px;">
             <div style="background-color: #e8f5e8; border-left: 4px solid #4caf50; padding: 15px; margin: 20px 0;">
                 <p style="margin: 0; font-size: 16px; color: #2d5a2d;">
-                    ✓ No landing page change alerts were detected in the last 24 hours for English campaigns sourced from LATAM and Greater China.
+                    ✓ No landing page change alerts were detected in the last 24 hours for campaigns targeting {target_label} from LATAM and Greater China publishers.
                 </p>
                 <p style="margin: 10px 0 0 0; font-size: 14px; color: #4a7c4a;">
                     This is a good sign! Your campaigns are operating normally.
                 </p>
             </div>
-            
+
             <p style="color: #666; font-size: 12px;">
                 Generated by Campaign Alerts System at {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}
             </p>
@@ -646,52 +671,88 @@ def generate_no_alerts_email_html() -> str:
     """
 
 
-def main():
-    """Main alert checker with clean structure"""
-    
-    log_message("=" * 80)
-    log_message("🎯 GEOEDGE LP ALERTS CHECKER - CLEAN START")
-    log_message("=" * 80)
-    
+def _format_target_label(target_locations: set[str]) -> str:
+    return "/".join(sorted(target_locations))
+
+
+def _format_target_csv(target_locations: set[str]) -> str:
+    return ",".join(sorted(target_locations))
+
+
+def _run_alert_flow(flow_name: str, target_locations: set[str], email_subject: str) -> None:
+    """Execute full fetch→process→email flow for a target set."""
+
     try:
+        log_message("=" * 80)
+        log_message(f"🎯 [{flow_name}] GEOEDGE LP ALERTS CHECKER")
+        log_message("=" * 80)
+
+        target_csv = _format_target_csv(target_locations)
+        target_label = _format_target_label(target_locations)
+
         # Step 1: Fetch alerts from GeoEdge API
-        alerts = fetch_alerts_from_geoedge()
-        
+        alerts = fetch_alerts_from_geoedge(target_csv, flow_name)
+
         if not alerts:
             log_message("⚠️ No alerts found from API")
             filtered_alerts = []
         else:
             log_message(f"✅ Found {len(alerts)} alerts from API")
-            
+
             # Step 2: Process alerts to find target regions
-            filtered_alerts = process_alerts_to_target_regions(alerts)
-            
+            filtered_alerts = process_alerts_to_target_regions(alerts, target_locations)
+
             if not filtered_alerts:
                 log_message("⚠️ No alerts match target regions (LATAM + Greater China)")
                 filtered_alerts = []
-        
+
         # Step 3: Send email (even if no alerts)
         recipients = os.getenv("RECIPIENTS", "").strip()
         if not recipients:
             log_message("⚠️ No RECIPIENTS configured in .env")
             return
-        
-        recipient_list = [r.strip() for r in recipients.split(",")]
+
+        recipient_list = [r.strip() for r in recipients.split(",") if r.strip()]
         cc_recipients = os.getenv("CC_RECIPIENTS", "").strip()
-        cc_list = [r.strip() for r in cc_recipients.split(",")] if cc_recipients else []
-        
-        log_message(f"📧 Sending email to: {', '.join(recipient_list)}")
+        cc_list = [r.strip() for r in cc_recipients.split(",") if r.strip()] if cc_recipients else []
+
+        log_message(f"📧 [{flow_name}] Sending email to: {', '.join(recipient_list)}")
         if cc_list:
-            log_message(f"📧 CC: {', '.join(cc_list)}")
-        
-        if send_alert_email(recipient_list, filtered_alerts, cc_recipients=cc_list):
-            log_message(f"✅ Alert check complete: {len(filtered_alerts)} alerts sent to {len(recipient_list)} recipients")
+            log_message(f"📧 [{flow_name}] CC: {', '.join(cc_list)}")
+        log_message(f"📧 [{flow_name}] Subject: {email_subject}")
+
+        if send_alert_email(
+            recipient_list,
+            filtered_alerts,
+            target_locations,
+            target_label,
+            cc_recipients=cc_list,
+            subject=email_subject,
+        ):
+            log_message(
+                f"✅ [{flow_name}] Alert check complete: {len(filtered_alerts)} alerts sent to {len(recipient_list)} recipients"
+            )
         else:
-            log_message("❌ Failed to send email")
-    
+            log_message(f"❌ [{flow_name}] Failed to send email")
+
     except Exception as e:
-        log_message(f"❌ Error: {str(e)}")
-        sys.exit(1)
+        log_message(f"❌ [{flow_name}] Error: {str(e)}")
+
+
+def main():
+    """Run both primary (US/GB/CA/AU) and ES/IT flows with shared recipients."""
+
+    _run_alert_flow(
+        flow_name="Primary US/GB/CA/AU",
+        target_locations=TARGET_LOCATIONS,
+        email_subject=EMAIL_SETTINGS["subject"],
+    )
+
+    _run_alert_flow(
+        flow_name="ES/IT",
+        target_locations=TARGET_LOCATIONS_ESIT,
+        email_subject=EMAIL_SETTINGS.get("subject_esit", "🚨 LP/Creative/Auto-Redirect Alerts - LATAM & Greater China Publishers → ES/IT Campaigns"),
+    )
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 # Regional codes
 TARGET_LOCATIONS = {"US", "GB", "CA", "AU"}  # Countries campaigns should target
+TARGET_LOCATIONS_ESIT = {"ES", "IT"}  # Additional focus markets
 LATAM_COUNTRIES = {"MX", "AR", "BR", "CL", "CO", "PE"}  # Publisher regions
 GREATER_CHINA_COUNTRIES = {"CN", "HK", "TW", "MO"}  # Publisher regions
 PUBLISHER_REGIONS = LATAM_COUNTRIES | GREATER_CHINA_COUNTRIES  # Where publishers are from
@@ -13,6 +14,8 @@ COUNTRY_DISPLAY = {
     "GB": "🇬🇧 United Kingdom", 
     "CA": "🇨🇦 Canada",
     "AU": "🇦🇺 Australia",
+    "ES": "🇪🇸 Spain",
+    "IT": "🇮🇹 Italy",
     # LATAM Publisher Regions
     "MX": "🇲🇽 Mexico",
     "AR": "🇦🇷 Argentina",
@@ -44,7 +47,8 @@ REGION_LABEL = {
 # Email constants
 EMAIL_SETTINGS = {
     "from_address": "lp_change_alert@taboola.com",
-    "subject": "🚨 LP/Creative/Auto-Redirect Alerts - LATAM & Greater China Publishers → US/GB/CA/AU Campaigns",
+    "subject": "🚨 LP/Creative/Auto-Redirect Alerts - LATAM & Greater China Advertisers → US/GB/CA/AU Campaigns",
+    "subject_esit": "🚨 LP/Creative/Auto-Redirect Alerts - LATAM & Greater China Advertisers → ES/IT Campaigns",
     "logo_url": "https://www.taboola.com/assets/taboola-logo-dark.png",
 }
 
