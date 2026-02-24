@@ -75,7 +75,7 @@ def get_database_connection():
 
 
 def fetch_alerts_from_geoedge(
-    target_countries_csv: str | None = None,
+    target_countries_csv: Optional[str] = None,
     flow_label: str = "Primary",
 ) -> List[Dict[str, Any]]:
     """
@@ -195,7 +195,7 @@ def fetch_alerts_from_geoedge(
 
 def process_alerts_to_target_regions(
     alerts: List[Dict[str, Any]],
-    target_countries: set[str] | None = None,
+    target_countries: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Process alerts and find campaigns from LATAM & Greater China publishers targeting provided countries.
@@ -377,8 +377,8 @@ def send_alert_email(
     alerts: List[Dict[str, Any]],
     target_locations: set[str],
     target_label: str,
-    cc_recipients: List[str] | None = None,
-    subject: str | None = None,
+    cc_recipients: Optional[List[str]] = None,
+    subject: Optional[str] = None,
 ) -> bool:
     """Send email alert with LP changes for the given target set."""
 
@@ -440,8 +440,8 @@ def send_alert_email(
 
 def generate_alert_email_html(
     alerts: List[Dict[str, Any]],
-    target_locations: set[str] | None = None,
-    target_label: str | None = None,
+    target_locations: Optional[set[str]] = None,
+    target_label: Optional[str] = None,
 ) -> Tuple[str, Optional[str], Optional[str]]:
     """Generate HTML email content for alerts and CSV attachment data."""
 
@@ -644,7 +644,7 @@ def generate_alert_email_html(
     return html_content, csv_content, csv_filename
 
 
-def generate_no_alerts_email_html(target_label: str | None = None) -> str:
+def generate_no_alerts_email_html(target_label: Optional[str] = None) -> str:
     """Generate HTML email content when no alerts found."""
 
     target_label = target_label or "/".join(sorted(TARGET_LOCATIONS))
