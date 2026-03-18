@@ -8,6 +8,7 @@ import os
 import sys
 import csv
 import io
+import json
 import smtplib
 import requests
 from datetime import datetime, timedelta, timezone
@@ -17,23 +18,46 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 import pymysql
 from pymysql import MySQLError
+import vertica_python
 from dotenv import load_dotenv
 
 # Import local modules
 from config import (
     TARGET_LOCATIONS,
     TARGET_LOCATIONS_ESIT,
-    PUBLISHER_REGIONS,
     LATAM_COUNTRIES,
     GREATER_CHINA_COUNTRIES,
     ALERT_CHECK_HOURS,
     EMAIL_SETTINGS,
-    COUNTRY_DISPLAY,
 )
 
 load_dotenv()
 
 LOG_FILE = "alert_checker.log"
+ALERT_HISTORY_FILE = "alert_history.json"
+ALERT_HISTORY_DAYS = 7  # Mark campaigns as RECURRING if seen within this window
+
+
+def load_alert_history() -> Dict[str, str]:
+    """Load history of previously reported campaign+trigger combos. Returns {key: iso_date}."""
+    if not os.path.exists(ALERT_HISTORY_FILE):
+        return {}
+    try:
+        with open(ALERT_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_alert_history(history: Dict[str, str]) -> None:
+    """Save alert history, pruning entries older than ALERT_HISTORY_DAYS."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=ALERT_HISTORY_DAYS)
+    pruned = {k: v for k, v in history.items() if datetime.fromisoformat(v) > cutoff}
+    try:
+        with open(ALERT_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(pruned, f, indent=2)
+    except Exception as e:
+        log_message(f"⚠️ Could not save alert history: {e}")
 
 
 def log_message(message: str) -> None:
@@ -74,6 +98,51 @@ def get_database_connection():
     )
 
 
+def filter_active_campaigns(campaign_ids: List[int]) -> set:
+    """
+    Query Vertica to return only campaign IDs that are currently APPROVED + RUNNING.
+    Campaigns that are STOPPED, TERMINATED, REJECTED, SPEND_COMPLETED are excluded.
+    Returns a set of active campaign_ids.
+    """
+    if not campaign_ids:
+        return set()
+
+    try:
+        conn_info = {
+            "host": _env_or_fail("VERTICA_HOST"),
+            "port": int(os.getenv("VERTICA_PORT", "5433")),
+            "user": _env_or_fail("VERTICA_USER"),
+            "password": os.getenv("VERTICA_PASSWORD", ""),
+            "database": _env_or_fail("VERTICA_DB"),
+            "connection_timeout": 30,
+        }
+
+        placeholders = ",".join(str(cid) for cid in campaign_ids)
+        sql = f"""
+            SELECT id
+            FROM trc.sp_campaigns_latest_snapshot
+            WHERE id IN ({placeholders})
+              AND status = 'APPROVED'
+              AND display_status = 'RUNNING'
+        """
+
+        with vertica_python.connect(**conn_info) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+                active_ids = {row[0] for row in rows}
+
+        skipped = set(campaign_ids) - active_ids
+        if skipped:
+            log_message(f"🚫 Vertica status check: skipping {len(skipped)} non-active campaigns: {skipped}")
+        log_message(f"✅ Vertica status check: {len(active_ids)}/{len(campaign_ids)} campaigns are APPROVED+RUNNING")
+        return active_ids
+
+    except Exception as e:
+        log_message(f"⚠️ Vertica status check failed ({e}) — including all campaigns to avoid false negatives")
+        return set(campaign_ids)  # Fail open: don't drop campaigns if Vertica is unreachable
+
+
 def fetch_alerts_from_geoedge(
     target_countries_csv: Optional[str] = None,
     flow_label: str = "Primary",
@@ -93,7 +162,16 @@ def fetch_alerts_from_geoedge(
         "Content-Type": "application/json",
     }
 
-    log_message(f"🔍 [{flow_label}] Fetching alerts for 3 trigger types targeting: {target_countries_csv}")
+    # Build 24-hour time window for the API call
+    now_utc = datetime.now(timezone.utc)
+    from_dt = now_utc - timedelta(hours=ALERT_CHECK_HOURS)
+    from_ts = int(from_dt.timestamp())
+    to_ts = int(now_utc.timestamp())
+
+    log_message(
+        f"🔍 [{flow_label}] Fetching alerts for 3 trigger types targeting: {target_countries_csv} "
+        f"(window: {from_dt.strftime('%Y-%m-%d %H:%M')} → {now_utc.strftime('%Y-%m-%d %H:%M')} UTC)"
+    )
 
     # Define trigger types: LP Change, Creative Change, Auto Redirect
     trigger_types = {
@@ -113,6 +191,8 @@ def fetch_alerts_from_geoedge(
             "trigger_type_id": trigger_id,
             "full_raw": 1,
             "location_id": target_countries_csv,
+            "from": from_ts,
+            "to": to_ts,
         }
 
         try:
@@ -266,11 +346,16 @@ def process_alerts_to_target_regions(
     project_data = {}
     try:
         connection = get_database_connection()
-        
+
+        # Build country lists dynamically from config so SQL stays in sync
+        latam_sql = ", ".join(f"'{c}'" for c in sorted(LATAM_COUNTRIES))
+        china_sql = ", ".join(f"'{c}'" for c in sorted(GREATER_CHINA_COUNTRIES))
+        publisher_countries_sql = ", ".join(f"'{c}'" for c in sorted(LATAM_COUNTRIES | GREATER_CHINA_COUNTRIES))
+
         with connection.cursor() as cursor:
             # Create placeholders for IN clause
             placeholders = ','.join(['%s'] * len(unique_project_ids))
-            
+
             sql = f"""
                 SELECT DISTINCT
                     p.project_id,
@@ -280,16 +365,17 @@ def process_alerts_to_target_regions(
                     pub.country,
                     pub.name as publisher_name,
                     p.locations,
-                    CASE 
-                        WHEN pub.country IN ('MX', 'AR', 'BR', 'CL', 'CO', 'PE') THEN 'LATAM'
-                        WHEN pub.country IN ('CN', 'HK', 'TW', 'MO') THEN 'Greater China'
+                    CASE
+                        WHEN pub.country IN ({latam_sql}) THEN 'LATAM'
+                        WHEN pub.country IN ({china_sql}) THEN 'Greater China'
                         ELSE 'Other'
                     END AS region_type
                 FROM trc.geo_edge_projects p
                 JOIN trc.geo_edge_landing_pages lp ON p.campaign_id = lp.campaign_id
                 JOIN trc.publishers pub ON lp.advertiser_id = pub.id
                 WHERE p.project_id IN ({placeholders})
-                    AND pub.country IN ('MX', 'AR', 'BR', 'CL', 'CO', 'PE', 'CN', 'HK', 'TW', 'MO')
+                    AND p.scan_status = 'SCANNING'
+                    AND pub.country IN ({publisher_countries_sql})
             """
             
             cursor.execute(sql, unique_project_ids)
@@ -313,9 +399,17 @@ def process_alerts_to_target_regions(
         log_message(f"❌ Error in batch query: {str(e)}")
         return []
     
-    # Step 4: Match alerts with project data (fast lookup)
+    # Step 4: Vertica active-campaign filter — drop STOPPED/TERMINATED/REJECTED campaigns
+    all_candidate_ids = [
+        result["campaign_id"]
+        for results in project_data.values()
+        for result in results
+    ]
+    active_campaign_ids = filter_active_campaigns(list(set(all_candidate_ids)))
+
+    # Step 5: Match alerts with project data (fast lookup)
     matching_alerts = []
-    
+
     for alert in filtered_alerts:
         project_id = alert["project_id"]
         location_code = alert["location_code"]
@@ -332,12 +426,17 @@ def process_alerts_to_target_regions(
                 publisher_name = result["publisher_name"]
                 locations = result["locations"]
                 region_type = result["region_type"]
-                
+
+                # Skip campaigns that are not APPROVED+RUNNING in Taboola (Vertica check)
+                if campaign_id not in active_campaign_ids:
+                    log_message(f"    🚫 SKIPPED! Campaign {campaign_id} is not active (STOPPED/TERMINATED/REJECTED)")
+                    continue
+
                 # Check if campaign targets our desired locations (US, GB, CA, AU)
                 # Handle both "US,CA,GB,DE" and "US, CA, GB, DE" formats
                 if locations:
                     # Split by comma and strip whitespace from each country code
-                    campaign_target_countries = set(country.strip() for country in locations.split(","))
+                    campaign_target_countries = set(loc.strip() for loc in locations.split(","))
                 else:
                     campaign_target_countries = set()
                 
@@ -453,6 +552,7 @@ def generate_alert_email_html(
     china_alerts = [alert for alert in alerts if alert.get("region_type") == "Greater China"]
     rows_for_csv: List[Dict[str, Any]] = []
     csv_headers = [
+        "Status",
         "Region",
         "Account ID",
         "Account Name",
@@ -500,9 +600,11 @@ def generate_alert_email_html(
                 elif trigger_id_str == "32":
                     trigger_name = "AUTO REDIRECT"
             
+            recurrence_status = alert.get("recurrence_status", "NEW")
+
             # Create unique key for grouping by account + alert type
             group_key = f"{account_id}|{trigger_name}|{publisher_country}|{campaign_locations}"
-            
+
             if group_key not in grouped_alerts:
                 grouped_alerts[group_key] = {
                     "account_id": account_id,
@@ -511,7 +613,11 @@ def generate_alert_email_html(
                     "campaign_locations": campaign_locations,
                     "trigger_name": trigger_name,
                     "campaign_data": {},  # Store campaign_id -> list of alert_details_urls mapping
+                    "recurrence_status": recurrence_status,
                 }
+            elif recurrence_status == "NEW":
+                # Promote group to NEW if any alert in it is new
+                grouped_alerts[group_key]["recurrence_status"] = "NEW"
             
             # Add campaign ID and its alert URL to the group
             campaign_id = alert.get("campaign_id", "Unknown")
@@ -550,7 +656,11 @@ def generate_alert_email_html(
                 campaign_locations_filtered = "N/A"
             
             trigger_name = group_data["trigger_name"]
-            
+            recurrence_status = group_data.get("recurrence_status", "NEW")
+            is_new = recurrence_status == "NEW"
+            status_color = "#1a7340" if is_new else "#856404"
+            status_bg = "#d4edda" if is_new else "#fff3cd"
+
             for campaign_id, alert_urls in group_data["campaign_data"].items():
                 primary_url = alert_urls[0] if alert_urls else ""
                 if primary_url:
@@ -558,6 +668,8 @@ def generate_alert_email_html(
                     link_cell = f'<a href="{primary_url}" target="_blank" style="color: #1a73e8; text-decoration: underline;">View Alert</a>'
                 else:
                     link_cell = "N/A"
+
+                status_cell = f'<span style="background:{status_bg};color:{status_color};padding:2px 6px;border-radius:3px;font-size:11px;font-weight:bold;">{recurrence_status}</span>'
 
                 rows_for_csv.append({
                     "Region": region_name,
@@ -568,10 +680,12 @@ def generate_alert_email_html(
                     "Alert Link": primary_url,
                     "Target Locations": campaign_locations_filtered,
                     "Alert Type": trigger_name,
+                    "Status": recurrence_status,
                 })
 
                 rows += f"""
                 <tr>
+                    <td style="padding: 8px; border: 1px solid #ddd;">{status_cell}</td>
                     <td style="padding: 8px; border: 1px solid #ddd;">{account_id}</td>
                     <td style="padding: 8px; border: 1px solid #ddd;">{account_name}</td>
                     <td style="padding: 8px; border: 1px solid #ddd;">{publisher_country}</td>
@@ -590,6 +704,7 @@ def generate_alert_email_html(
             <table style="width: 100%; border-collapse: collapse; margin: 10px 0;">
                 <thead>
                     <tr style="background-color: #2c5282; color: white;">
+                        <th style="padding: 10px; border: 1px solid #ddd;">Status</th>
                         <th style="padding: 10px; border: 1px solid #ddd;">Account ID</th>
                         <th style="padding: 10px; border: 1px solid #ddd;">Account Name</th>
                         <th style="padding: 10px; border: 1px solid #ddd;">Country</th>
@@ -721,6 +836,27 @@ def _run_alert_flow(
             if not filtered_alerts:
                 log_message("⚠️ No alerts match target regions (LATAM + Greater China)")
                 filtered_alerts = []
+
+        # Tag each alert as NEW or RECURRING based on history
+        history = load_alert_history()
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        today = now.date()
+        for alert in filtered_alerts:
+            key = f"{alert.get('campaign_id')}|{alert.get('trigger_type_name', '')}"
+            if key in history:
+                last_seen = datetime.fromisoformat(history[key])
+                # Only RECURRING if seen on a previous calendar day.
+                # Same-day entries (duplicates or cross-flow in same run) stay NEW.
+                if last_seen.date() < today:
+                    days_ago = (today - last_seen.date()).days
+                    alert["recurrence_status"] = f"RECURRING (last seen {days_ago}d ago)"
+                else:
+                    alert["recurrence_status"] = "NEW"
+            else:
+                alert["recurrence_status"] = "NEW"
+            history[key] = now_iso
+        save_alert_history(history)
 
         # Step 3: Send email (even if no alerts)
         recipient_list = _parse_recipients(recipients_env, fallback_recipients_env)
